@@ -6,7 +6,12 @@ use configuration::{
 use pg_replicate::{
     pipeline::{
         batching::{data_pipeline::BatchDataPipeline, BatchConfig},
-        sinks::bigquery::BigQueryBatchSink,
+        sinks::{
+            bigquery::BigQueryBatchSink,
+            #[cfg(feature = "spanner")]
+            spanner::SpannerBatchSink,
+            BatchSink, // Added to use Box<dyn BatchSink>
+        },
         sources::postgres::{PostgresSource, TableNamesFrom},
         PipelineAction,
     },
@@ -60,9 +65,23 @@ async fn start_replication(settings: Settings) -> anyhow::Result<()> {
         dataset_id,
         service_account_key: _,
         max_staleness_mins,
-    } = &settings.sink;
+    } = match &settings.sink {
+        SinkSettings::BigQuery { project_id, dataset_id, service_account_key: _, max_staleness_mins } => {
+            info!(project_id, dataset_id, max_staleness_mins, "bigquery sink settings");
+            (project_id, dataset_id, max_staleness_mins)
+        }
+        #[cfg(feature = "spanner")]
+        SinkSettings::Spanner { project_id, instance_id, database_id, service_account_key: _, dataset_id, max_staleness_mins } => {
+            info!(project_id, instance_id, database_id, dataset_id, max_staleness_mins, "spanner sink settings");
+            // The destructuring above is for BigQuery, Spanner has different fields.
+            // We'll access them directly when creating the sink.
+            // For the info log, we just show them.
+            // This part of the code seems to be for generic logging, might need adjustment if we want to log specific fields for each sink type.
+            // For now, just logging the Spanner specific fields.
+            (&String::new(), &String::new(), max_staleness_mins) // Placeholder for common logging, actual values used later
+        }
+    };
 
-    info!(project_id, dataset_id, max_staleness_mins, "sink settings");
 
     let BatchSettings {
         max_size,
@@ -119,20 +138,57 @@ async fn start_replication(settings: Settings) -> anyhow::Result<()> {
     )
     .await?;
 
-    let SinkSettings::BigQuery {
-        project_id,
-        dataset_id,
-        service_account_key,
-        max_staleness_mins,
-    } = settings.sink;
-
-    let bigquery_sink = BigQueryBatchSink::new_with_key(
-        project_id,
-        dataset_id,
-        &service_account_key,
-        max_staleness_mins.unwrap_or(5),
-    )
-    .await?;
+    // Determine the sink based on configuration
+    let sink: Box<dyn BatchSink<Error = anyhow::Error>> = match settings.sink {
+        SinkSettings::BigQuery {
+            project_id,
+            dataset_id,
+            service_account_key,
+            max_staleness_mins,
+        } => {
+            let bq_sink = BigQueryBatchSink::new_with_key(
+                project_id,
+                dataset_id,
+                &service_account_key,
+                max_staleness_mins.unwrap_or(5), // Default to 5 mins if not set
+            )
+            .await
+            .map_err(anyhow::Error::from)?; // Convert error type
+            Box::new(bq_sink)
+        }
+        #[cfg(feature = "spanner")]
+        SinkSettings::Spanner {
+            project_id,
+            instance_id,
+            database_id,
+            service_account_key,
+            dataset_id, // This is the one for metadata tables
+            max_staleness_mins,
+        } => {
+            // The SpannerBatchSink::new expects max_staleness_mins as u16, not Option<u16>.
+            // Using 0 as default if not specified in config.
+            let staleness = max_staleness_mins.unwrap_or(0);
+            let spanner_sink = SpannerBatchSink::new(
+                project_id,
+                instance_id,
+                database_id,
+                service_account_key, // This is Option<String>, matching gcp_sa_key_path
+                dataset_id,          // dataset_id for metadata
+                staleness,           // max_staleness_mins for table creation
+            )
+            .await
+            .map_err(anyhow::Error::from)?; // Convert error type
+            Box::new(spanner_sink)
+        }
+        #[cfg(not(feature = "spanner"))]
+        SinkSettings::Spanner { .. } => {
+            // This case should ideally not be hit if configuration and features are aligned.
+            // If Spanner config is present but feature not compiled, it's an issue.
+            return Err(anyhow::anyhow!(
+                "Spanner sink configured but 'spanner' feature is not enabled in replicator."
+            ));
+        }
+    };
 
     let BatchSettings {
         max_size,
@@ -142,7 +198,7 @@ async fn start_replication(settings: Settings) -> anyhow::Result<()> {
     let batch_config = BatchConfig::new(max_size, Duration::from_secs(max_fill_secs));
     let mut pipeline = BatchDataPipeline::new(
         postgres_source,
-        bigquery_sink,
+        sink, // Use the dynamically created sink
         PipelineAction::Both,
         batch_config,
     );

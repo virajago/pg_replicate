@@ -27,6 +27,14 @@ pub enum SinkConfig {
         #[serde(skip_serializing_if = "Option::is_none")]
         max_staleness_mins: Option<u16>,
     },
+    Spanner {
+        project_id: String,
+        instance_id: String,
+        database_id: String,
+        service_account_key: Option<String>, // Spanner might use default ADC
+        // max_staleness_mins is not typically configured directly for Spanner tables in the same way as BQ CDC.
+        // Data retention and point-in-time recovery are handled differently.
+    },
 }
 
 impl SinkConfig {
@@ -38,25 +46,54 @@ impl SinkConfig {
             project_id,
             dataset_id,
             service_account_key,
-            max_staleness_mins,
-        } = self;
-
-        let (encrypted_sa_key, nonce) =
-            encrypt(service_account_key.as_bytes(), &encryption_key.key)?;
-        let encrypted_encoded_sa_key = BASE64_STANDARD.encode(encrypted_sa_key);
-        let encoded_nonce = BASE64_STANDARD.encode(nonce.as_ref());
-        let encrypted_sa_key = EncryptedValue {
-            id: encryption_key.id,
-            nonce: encoded_nonce,
-            value: encrypted_encoded_sa_key,
-        };
-
-        Ok(SinkConfigInDb::BigQuery {
             project_id,
             dataset_id,
-            service_account_key: encrypted_sa_key,
+            service_account_key,
             max_staleness_mins,
-        })
+        } => {
+            let (encrypted_sa_key, nonce) =
+                encrypt(service_account_key.as_bytes(), &encryption_key.key)?;
+            let encrypted_encoded_sa_key = BASE64_STANDARD.encode(encrypted_sa_key);
+            let encoded_nonce = BASE64_STANDARD.encode(nonce.as_ref());
+            let encrypted_sa_key_value = EncryptedValue {
+                id: encryption_key.id,
+                nonce: encoded_nonce,
+                value: encrypted_encoded_sa_key,
+            };
+
+            Ok(SinkConfigInDb::BigQuery {
+                project_id,
+                dataset_id,
+                service_account_key: encrypted_sa_key_value,
+                max_staleness_mins,
+            })
+        }
+        SinkConfig::Spanner {
+            project_id,
+            instance_id,
+            database_id,
+            service_account_key,
+        } => {
+            let encrypted_sa_key_opt = if let Some(sa_key) = service_account_key {
+                let (encrypted_sa_key, nonce) = encrypt(sa_key.as_bytes(), &encryption_key.key)?;
+                let encrypted_encoded_sa_key = BASE64_STANDARD.encode(encrypted_sa_key);
+                let encoded_nonce = BASE64_STANDARD.encode(nonce.as_ref());
+                Some(EncryptedValue {
+                    id: encryption_key.id,
+                    nonce: encoded_nonce,
+                    value: encrypted_encoded_sa_key,
+                })
+            } else {
+                None
+            };
+
+            Ok(SinkConfigInDb::Spanner {
+                project_id,
+                instance_id,
+                database_id,
+                service_account_key: encrypted_sa_key_opt,
+            })
+        }
     }
 }
 
@@ -74,6 +111,18 @@ impl Debug for SinkConfig {
                 .field("dataset_id", dataset_id)
                 .field("service_account_key", &"REDACTED")
                 .field("max_staleness_mins", max_staleness_mins)
+                .finish(),
+            Self::Spanner {
+                project_id,
+                instance_id,
+                database_id,
+                service_account_key: _,
+            } => f
+                .debug_struct("Spanner")
+                .field("project_id", project_id)
+                .field("instance_id", instance_id)
+                .field("database_id", database_id)
+                .field("service_account_key", &"REDACTED_IF_PRESENT")
                 .finish(),
         }
     }
@@ -96,40 +145,85 @@ pub enum SinkConfigInDb {
         #[serde(skip_serializing_if = "Option::is_none")]
         max_staleness_mins: Option<u16>,
     },
+    Spanner {
+        project_id: String,
+        instance_id: String,
+        database_id: String,
+        service_account_key: Option<EncryptedValue>,
+    },
 }
 
 impl SinkConfigInDb {
     fn into_config(self, encryption_key: &EncryptionKey) -> Result<SinkConfig, SinksDbError> {
-        let SinkConfigInDb::BigQuery {
-            project_id,
-            dataset_id,
-            service_account_key: encrypted_sa_key,
-            max_staleness_mins,
-        } = self;
+        match self {
+            SinkConfigInDb::BigQuery {
+                project_id,
+                dataset_id,
+                service_account_key: encrypted_sa_key_value,
+                max_staleness_mins,
+            } => {
+                if encrypted_sa_key_value.id != encryption_key.id {
+                    return Err(SinksDbError::MismatchedKeyId(
+                        encrypted_sa_key_value.id,
+                        encryption_key.id,
+                    ));
+                }
 
-        if encrypted_sa_key.id != encryption_key.id {
-            return Err(SinksDbError::MismatchedKeyId(
-                encrypted_sa_key.id,
-                encryption_key.id,
-            ));
+                let encrypted_sa_key_bytes = BASE64_STANDARD.decode(encrypted_sa_key_value.value)?;
+                let nonce = Nonce::try_assume_unique_for_key(
+                    &BASE64_STANDARD.decode(encrypted_sa_key_value.nonce)?,
+                )?;
+                let decrypted_sa_key = from_utf8(&decrypt(
+                    encrypted_sa_key_bytes,
+                    nonce,
+                    &encryption_key.key,
+                )?)?
+                .to_string();
+
+                Ok(SinkConfig::BigQuery {
+                    project_id,
+                    dataset_id,
+                    service_account_key: decrypted_sa_key,
+                    max_staleness_mins,
+                })
+            }
+            SinkConfigInDb::Spanner {
+                project_id,
+                instance_id,
+                database_id,
+                service_account_key: encrypted_sa_key_opt,
+            } => {
+                let decrypted_sa_key_opt = if let Some(encrypted_sa_key) = encrypted_sa_key_opt {
+                    if encrypted_sa_key.id != encryption_key.id {
+                        return Err(SinksDbError::MismatchedKeyId(
+                            encrypted_sa_key.id,
+                            encryption_key.id,
+                        ));
+                    }
+                    let encrypted_sa_key_bytes = BASE64_STANDARD.decode(encrypted_sa_key.value)?;
+                    let nonce = Nonce::try_assume_unique_for_key(
+                        &BASE64_STANDARD.decode(encrypted_sa_key.nonce)?,
+                    )?;
+                    Some(
+                        from_utf8(&decrypt(
+                            encrypted_sa_key_bytes,
+                            nonce,
+                            &encryption_key.key,
+                        )?)?
+                        .to_string(),
+                    )
+                } else {
+                    None
+                };
+
+                Ok(SinkConfig::Spanner {
+                    project_id,
+                    instance_id,
+                    database_id,
+                    service_account_key: decrypted_sa_key_opt,
+                })
+            }
         }
-
-        let encrypted_sa_key_bytes = BASE64_STANDARD.decode(encrypted_sa_key.value)?;
-        let nonce =
-            Nonce::try_assume_unique_for_key(&BASE64_STANDARD.decode(encrypted_sa_key.nonce)?)?;
-        let decrypted_sa_key = from_utf8(&decrypt(
-            encrypted_sa_key_bytes,
-            nonce,
-            &encryption_key.key,
-        )?)?
-        .to_string();
-
-        Ok(SinkConfig::BigQuery {
-            project_id,
-            dataset_id,
-            service_account_key: decrypted_sa_key,
-            max_staleness_mins,
-        })
     }
 }
 
@@ -351,35 +445,96 @@ mod tests {
 
     #[test]
     pub fn deserialize_settings_test() {
-        let settings = r#"{
+        let settings_bq = r#"{
             "big_query": {
                 "project_id": "project-id",
                 "dataset_id": "dataset-id",
                 "service_account_key": "service-account-key"
             }
         }"#;
-        let actual = serde_json::from_str::<SinkConfig>(settings);
-        let expected = SinkConfig::BigQuery {
+        let actual_bq = serde_json::from_str::<SinkConfig>(settings_bq);
+        let expected_bq = SinkConfig::BigQuery {
             project_id: "project-id".to_string(),
             dataset_id: "dataset-id".to_string(),
             service_account_key: "service-account-key".to_string(),
             max_staleness_mins: None,
         };
-        assert!(actual.is_ok());
-        assert_eq!(expected, actual.unwrap());
+        assert!(actual_bq.is_ok());
+        assert_eq!(expected_bq, actual_bq.unwrap());
+
+        let settings_spanner_full = r#"{
+            "spanner": {
+                "project_id": "sp-project",
+                "instance_id": "sp-instance",
+                "database_id": "sp-db",
+                "service_account_key": "sp-sa-key"
+            }
+        }"#;
+        let actual_spanner_full = serde_json::from_str::<SinkConfig>(settings_spanner_full);
+        let expected_spanner_full = SinkConfig::Spanner {
+            project_id: "sp-project".to_string(),
+            instance_id: "sp-instance".to_string(),
+            database_id: "sp-db".to_string(),
+            service_account_key: Some("sp-sa-key".to_string()),
+        };
+        assert!(actual_spanner_full.is_ok());
+        assert_eq!(expected_spanner_full, actual_spanner_full.unwrap());
+
+        let settings_spanner_no_sa = r#"{
+            "spanner": {
+                "project_id": "sp-project2",
+                "instance_id": "sp-instance2",
+                "database_id": "sp-db2",
+                "service_account_key": null
+            }
+        }"#;
+        let actual_spanner_no_sa = serde_json::from_str::<SinkConfig>(settings_spanner_no_sa);
+        let expected_spanner_no_sa = SinkConfig::Spanner {
+            project_id: "sp-project2".to_string(),
+            instance_id: "sp-instance2".to_string(),
+            database_id: "sp-db2".to_string(),
+            service_account_key: None,
+        };
+        assert!(actual_spanner_no_sa.is_ok());
+        assert_eq!(expected_spanner_no_sa, actual_spanner_no_sa.unwrap());
     }
 
     #[test]
     pub fn serialize_settings_test() {
-        let actual = SinkConfig::BigQuery {
+        let actual_bq = SinkConfig::BigQuery {
             project_id: "project-id".to_string(),
             dataset_id: "dataset-id".to_string(),
             service_account_key: "service-account-key".to_string(),
             max_staleness_mins: None,
         };
-        let expected = r#"{"big_query":{"project_id":"project-id","dataset_id":"dataset-id","service_account_key":"service-account-key"}}"#;
-        let actual = serde_json::to_string(&actual);
-        assert!(actual.is_ok());
-        assert_eq!(expected, actual.unwrap());
+        let expected_bq = r#"{"big_query":{"project_id":"project-id","dataset_id":"dataset-id","service_account_key":"service-account-key"}}"#;
+        let actual_bq_json = serde_json::to_string(&actual_bq);
+        assert!(actual_bq_json.is_ok());
+        assert_eq!(expected_bq, actual_bq_json.unwrap());
+
+        let actual_spanner_full = SinkConfig::Spanner {
+            project_id: "sp-project".to_string(),
+            instance_id: "sp-instance".to_string(),
+            database_id: "sp-db".to_string(),
+            service_account_key: Some("sp-sa-key".to_string()),
+        };
+        let expected_spanner_full = r#"{"spanner":{"project_id":"sp-project","instance_id":"sp-instance","database_id":"sp-db","service_account_key":"sp-sa-key"}}"#;
+        let actual_spanner_full_json = serde_json::to_string(&actual_spanner_full);
+        assert!(actual_spanner_full_json.is_ok());
+        assert_eq!(expected_spanner_full, actual_spanner_full_json.unwrap());
+
+        let actual_spanner_no_sa = SinkConfig::Spanner {
+            project_id: "sp-project2".to_string(),
+            instance_id: "sp-instance2".to_string(),
+            database_id: "sp-db2".to_string(),
+            service_account_key: None,
+        };
+        // Note: serde serializes Option<String>: None as `null` if not skipped,
+        // and skips it if `skip_serializing_if = "Option::is_none"` is on the field.
+        // For `service_account_key: Option<String>` without skip_serializing_if on Spanner variant:
+        let expected_spanner_no_sa = r#"{"spanner":{"project_id":"sp-project2","instance_id":"sp-instance2","database_id":"sp-db2","service_account_key":null}}"#;
+        let actual_spanner_no_sa_json = serde_json::to_string(&actual_spanner_no_sa);
+        assert!(actual_spanner_no_sa_json.is_ok());
+        assert_eq!(expected_spanner_no_sa, actual_spanner_no_sa_json.unwrap());
     }
 }

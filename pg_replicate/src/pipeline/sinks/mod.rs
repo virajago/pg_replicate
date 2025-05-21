@@ -15,6 +15,8 @@ use super::PipelineResumptionState;
 pub mod bigquery;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
+#[cfg(feature = "spanner")]
+pub mod spanner;
 #[cfg(feature = "stdout")]
 pub mod stdout;
 

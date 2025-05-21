@@ -71,6 +71,16 @@ pub enum SinkSettings {
         #[serde(skip_serializing_if = "Option::is_none")]
         max_staleness_mins: Option<u16>,
     },
+    Spanner {
+        project_id: String,
+        instance_id: String,
+        database_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        service_account_key: Option<String>, // Path to SA key or ADC
+        dataset_id: String, // Used for metadata tables in Spanner (e.g., _replicator_last_lsn)
+        #[serde(skip_serializing_if = "Option::is_none")]
+        max_staleness_mins: Option<u16>, // For table creation, if applicable
+    },
 }
 
 impl Debug for SinkSettings {
@@ -86,6 +96,22 @@ impl Debug for SinkSettings {
                 .field("project_id", project_id)
                 .field("dataset_id", dataset_id)
                 .field("service_account_key", &"REDACTED")
+                .field("max_staleness_mins", max_staleness_mins)
+                .finish(),
+            Self::Spanner {
+                project_id,
+                instance_id,
+                database_id,
+                service_account_key: _,
+                dataset_id,
+                max_staleness_mins,
+            } => f
+                .debug_struct("Spanner")
+                .field("project_id", project_id)
+                .field("instance_id", instance_id)
+                .field("database_id", database_id)
+                .field("service_account_key", &"REDACTED_IF_PRESENT")
+                .field("dataset_id", dataset_id)
                 .field("max_staleness_mins", max_staleness_mins)
                 .finish(),
         }

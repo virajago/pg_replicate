@@ -70,11 +70,31 @@ impl ResponseError for SinkError {
     }
 }
 
+// Define SinkType for request payload
+#[derive(Deserialize, Serialize, ToSchema, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SinkTypeRequest {
+    Bigquery, // Keep snake_case for consistency with existing SinkConfig variants if it was BigQuery
+    Spanner,
+}
+
 #[derive(Deserialize, ToSchema)]
 pub struct PostSinkRequest {
     pub name: String,
-    #[schema(required = true)]
-    pub config: SinkConfig,
+    pub sink_type: SinkTypeRequest,
+
+    // BigQuery fields - optional, filled based on sink_type
+    pub bigquery_project_id: Option<String>,
+    pub bigquery_dataset_id: Option<String>,
+    pub bigquery_service_account_key: Option<String>,
+    pub bigquery_max_staleness_mins: Option<u16>,
+
+    // Spanner fields - optional, filled based on sink_type
+    pub spanner_project_id: Option<String>,
+    pub spanner_instance_id: Option<String>,
+    pub spanner_database_id: Option<String>,
+    pub spanner_service_account_key: Option<String>,
+    // No max_staleness_mins for Spanner in this model as per db/sinks.rs
 }
 
 #[derive(Serialize, ToSchema)]
@@ -113,10 +133,50 @@ pub async fn create_sink(
     encryption_key: Data<EncryptionKey>,
     sink: Json<PostSinkRequest>,
 ) -> Result<impl Responder, SinkError> {
-    let sink = sink.0;
+    let payload = sink.0;
     let tenant_id = extract_tenant_id(&req)?;
-    let name = sink.name;
-    let config = sink.config;
+    let name = payload.name.clone();
+
+    let config = match payload.sink_type {
+        SinkTypeRequest::Bigquery => {
+            let project_id = payload.bigquery_project_id.ok_or_else(|| {
+                SinkError::TenantId(TenantIdError::Generic("bigquery_project_id is required for bigquery sink".to_string())) // Using TenantIdError for bad request
+            })?;
+            let dataset_id = payload.bigquery_dataset_id.ok_or_else(|| {
+                SinkError::TenantId(TenantIdError::Generic("bigquery_dataset_id is required for bigquery sink".to_string()))
+            })?;
+            let service_account_key =
+                payload.bigquery_service_account_key.ok_or_else(|| {
+                    SinkError::TenantId(TenantIdError::Generic(
+                        "bigquery_service_account_key is required for bigquery sink".to_string(),
+                    ))
+                })?;
+            SinkConfig::BigQuery {
+                project_id,
+                dataset_id,
+                service_account_key,
+                max_staleness_mins: payload.bigquery_max_staleness_mins,
+            }
+        }
+        SinkTypeRequest::Spanner => {
+            let project_id = payload.spanner_project_id.ok_or_else(|| {
+                SinkError::TenantId(TenantIdError::Generic("spanner_project_id is required for spanner sink".to_string()))
+            })?;
+            let instance_id = payload.spanner_instance_id.ok_or_else(|| {
+                SinkError::TenantId(TenantIdError::Generic("spanner_instance_id is required for spanner sink".to_string()))
+            })?;
+            let database_id = payload.spanner_database_id.ok_or_else(|| {
+                SinkError::TenantId(TenantIdError::Generic("spanner_database_id is required for spanner sink".to_string()))
+            })?;
+            SinkConfig::Spanner {
+                project_id,
+                instance_id,
+                database_id,
+                service_account_key: payload.spanner_service_account_key,
+            }
+        }
+    };
+
     let id = db::sinks::create_sink(&pool, tenant_id, &name, config, &encryption_key).await?;
     let response = PostSinkResponse { id };
     Ok(Json(response))
@@ -174,11 +234,52 @@ pub async fn update_sink(
     encryption_key: Data<EncryptionKey>,
     sink: Json<PostSinkRequest>,
 ) -> Result<impl Responder, SinkError> {
-    let sink = sink.0;
+    let payload = sink.0; // Renaming for clarity, this is PostSinkRequest
     let tenant_id = extract_tenant_id(&req)?;
     let sink_id = sink_id.into_inner();
-    let name = sink.name;
-    let config = sink.config;
+    let name = payload.name.clone();
+
+    // Similar logic to create_sink to construct SinkConfig from payload
+    let config = match payload.sink_type {
+        SinkTypeRequest::Bigquery => {
+            let project_id = payload.bigquery_project_id.ok_or_else(|| {
+                SinkError::TenantId(TenantIdError::Generic("bigquery_project_id is required for bigquery sink".to_string()))
+            })?;
+            let dataset_id = payload.bigquery_dataset_id.ok_or_else(|| {
+                SinkError::TenantId(TenantIdError::Generic("bigquery_dataset_id is required for bigquery sink".to_string()))
+            })?;
+            let service_account_key =
+                payload.bigquery_service_account_key.ok_or_else(|| {
+                    SinkError::TenantId(TenantIdError::Generic(
+                        "bigquery_service_account_key is required for bigquery sink".to_string(),
+                    ))
+                })?;
+            SinkConfig::BigQuery {
+                project_id,
+                dataset_id,
+                service_account_key,
+                max_staleness_mins: payload.bigquery_max_staleness_mins,
+            }
+        }
+        SinkTypeRequest::Spanner => {
+            let project_id = payload.spanner_project_id.ok_or_else(|| {
+                SinkError::TenantId(TenantIdError::Generic("spanner_project_id is required for spanner sink".to_string()))
+            })?;
+            let instance_id = payload.spanner_instance_id.ok_or_else(|| {
+                SinkError::TenantId(TenantIdError::Generic("spanner_instance_id is required for spanner sink".to_string()))
+            })?;
+            let database_id = payload.spanner_database_id.ok_or_else(|| {
+                SinkError::TenantId(TenantIdError::Generic("spanner_database_id is required for spanner sink".to_string()))
+            })?;
+            SinkConfig::Spanner {
+                project_id,
+                instance_id,
+                database_id,
+                service_account_key: payload.spanner_service_account_key,
+            }
+        }
+    };
+
     db::sinks::update_sink(&pool, tenant_id, &name, sink_id, config, &encryption_key)
         .await?
         .ok_or(SinkError::SinkNotFound(sink_id))?;

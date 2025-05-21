@@ -25,6 +25,7 @@ byteorder = { workspace = true }
 chrono = { workspace = true, features = ["serde"] }
 duckdb = { workspace = true, optional = true }
 futures = { workspace = true }
+gcloud-sdk = { version = "0.15.0", optional = true, features = [] }
 gcp-bigquery-client = { workspace = true, optional = true, features = [
     "rust-tls",
     "aws-lc-rs",
@@ -61,6 +62,7 @@ tracing-subscriber = { workspace = true, default-features = true, features = [
 [features]
 bigquery = ["dep:gcp-bigquery-client", "dep:prost"]
 duckdb = ["dep:duckdb"]
+spanner = ["dep:gcloud-sdk", "gcloud-sdk/spanner"]
 stdout = []
 # When enabled converts unknown types to bytes
 unknown_types_to_bytes = []

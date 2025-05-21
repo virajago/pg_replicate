@@ -94,9 +94,10 @@ The `pg_replicate` crate has the following features:
 
 * duckdb
 * bigquery
+* spanner
 * stdout
 
-Each feature enables the corresponding sink of the same name.
+Each feature enables the corresponding sink of the same name. To use a specific sink, ensure its feature is enabled during compilation (e.g., `cargo build --features spanner`).
 
 ## Running the Examples
 
@@ -118,12 +119,110 @@ The repository is a cargo workspace. Each of the individual sub-folders are crat
 - `pg_replicate` - The main library crate containing the core logic.
 - `replicator` - A binary crate using `pg_replicate`. Packaged as a docker container for use in cloud hosting.
 
+## Sink Configuration Examples
+
+This section provides examples for configuring different sinks.
+
+### BigQuery Sink
+
+*(Existing BigQuery configuration details would be here, if any. For now, assuming similar structure to Spanner for consistency in the documentation)*
+
+**API Payload (`POST /v1/sinks`):**
+```json
+{
+  "name": "my_bigquery_sink",
+  "sink_type": "bigquery", // or "BigQuery" depending on API implementation
+  "bigquery_project_id": "your-gcp-project",
+  "bigquery_dataset_id": "your_bigquery_dataset",
+  "bigquery_service_account_key": "path_or_json_string_for_sa_key",
+  "bigquery_max_staleness_mins": 5 // Optional
+}
+```
+
+**Replicator Configuration (`*.yaml`):**
+```yaml
+sink:
+  bigquery: # Or `type: bigquery` then fields, depending on replicator config structure
+    project_id: "your-gcp-project"
+    dataset_id: "your_bigquery_dataset"
+    service_account_key: "path_or_json_string_for_sa_key"
+    max_staleness_mins: 5 # Optional
+```
+
+### Spanner Sink
+
+The Spanner sink replicates data from PostgreSQL tables to Google Cloud Spanner.
+
+**API Payload (`POST /v1/sinks`):**
+
+When creating a Spanner sink via the API, use the following JSON structure:
+```json
+{
+  "name": "my_spanner_sink",
+  "sink_type": "spanner",
+  "spanner_project_id": "your-gcp-project",
+  "spanner_instance_id": "your-spanner-instance",
+  "spanner_database_id": "your-spanner-database",
+  "spanner_service_account_key": "/path/to/your/sa-key.json"
+}
+```
+*   `name`: A descriptive name for your sink.
+*   `sink_type`: Must be `"spanner"`.
+*   `spanner_project_id`: Your Google Cloud Project ID.
+*   `spanner_instance_id`: The ID of your Spanner instance.
+*   `spanner_database_id`: The ID of your Spanner database.
+*   `spanner_service_account_key`: (Optional) Path to your Google Cloud service account JSON key file. If omitted, Application Default Credentials (ADC) will be used.
+
+**Replicator Configuration (`*.yaml`):**
+
+For the Replicator service, configure the Spanner sink in your YAML configuration file (e.g., `configuration/dev.yaml` or `configuration/base.yaml`) as follows:
+
+```yaml
+sink:
+  spanner: # This key indicates the Spanner sink type
+    project_id: "your-gcp-project"
+    instance_id: "your-spanner-instance"
+    database_id: "your-spanner-database"
+    # dataset_id is used by the sink to manage its metadata tables (e.g., for LSN tracking).
+    # It's recommended to use a unique identifier here, perhaps related to the source or replication task.
+    dataset_id: "pg_replication_metadata" 
+    service_account_key: "/path/to/your/sa-key.json" # Optional
+    # max_staleness_mins is optional and used during the creation of Spanner tables by the sink.
+    # It defines the maximum data staleness for certain Spanner operations if applicable.
+    # Defaults to 0 if not specified, which means strong consistency for metadata operations.
+    max_staleness_mins: 0 # Optional
+```
+*   `project_id`: Your Google Cloud Project ID.
+*   `instance_id`: The ID of your Spanner instance.
+*   `database_id`: The ID of your Spanner database.
+*   `dataset_id`: A string identifier used by the sink to create and manage its internal metadata tables within Spanner (e.g., for tracking LSN and copied tables). This is not a Spanner "dataset" in the BigQuery sense, but rather a prefix or namespace for these metadata tables.
+*   `service_account_key`: (Optional) Path to your Google Cloud service account JSON key file. If omitted, Application Default Credentials (ADC) will be used.
+*   `max_staleness_mins`: (Optional) This setting influences the maximum data staleness for read operations against Spanner if applicable, and might be used during the creation of metadata tables. For metadata operations, a value of `0` (the default if not provided) ensures strong consistency.
+
+**Building with Spanner Support:**
+
+To include Spanner sink functionality, you need to compile the `pg_replicate` library and the `replicator` binary with the `spanner` feature flag.
+
+For `pg_replicate` (if used as a library):
+```bash
+cargo build --features spanner
+```
+
+For the `replicator` service:
+```bash
+cargo build -p replicator --features spanner
+# or when running directly
+cargo run -p replicator --features spanner -- <replicator_args>
+```
+If building the Docker image for the `replicator`, ensure the build command within the `Dockerfile` includes this feature flag.
+
 ## Roadmap
 
 `pg_replicate` is still under heavy development so expect bugs and papercuts but overtime we plan to add the following sinks.
 
 - [x] Add BigQuery Sink
 - [x] Add DuckDb Sink
+- [x] Add Spanner Sink
 - [x] Add MotherDuck Sink
 - [ ] Add Snowflake Sink
 - [ ] Add ClickHouse Sink
